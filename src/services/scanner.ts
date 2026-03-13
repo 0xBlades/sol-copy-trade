@@ -19,7 +19,6 @@ const CACHE_DURATION_MS = 5 * 60 * 1000;
 
 /**
  * Fetch top trader wallets from Bitquery GraphQL API.
- * Query: Get wallets with most profitable DEX trades on Solana in last 30 days.
  */
 export const scanSmartWallets = async (): Promise<SmartWallet[]> => {
   if (!config.BITQUERY_API_KEY) {
@@ -36,39 +35,43 @@ export const scanSmartWallets = async (): Promise<SmartWallet[]> => {
   try {
     console.log("Fetching top traders from Bitquery GraphQL API...");
 
-    // Calculate dates for 30-day range
+    // Calculate 30-day range
     const now = new Date();
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
     const since = thirtyDaysAgo.toISOString().split('T')[0];
 
-    const query = `
-      {
-        Solana {
-          DEXTradeByTokens(
-            orderBy: { descendingByField: "volumeUsd" }
-            limit: { count: 50 }
-            where: {
-              Block: { Date: { since: "${since}" } }
-              Trade: { Side: { Currency: { MintAddress: { not: "" } } } }
-            }
-          ) {
-            Trade {
+    // Query: Get top buyers by trade count in last 30 days
+    const query = `{
+      Solana {
+        DEXTrades(
+          limit: { count: 100 }
+          orderBy: { descending: Block_Time }
+          where: {
+            Block: { Date: { since: "${since}" } }
+          }
+        ) {
+          Trade {
+            Buy {
               Account {
-                Owner
+                Address
               }
-              Dex {
-                ProtocolName
-              }
+              AmountInUSD
+              Amount
             }
-            volumeUsd: sum(of: Trade_Side_AmountInUSD)
-            tradeCount: count
-            bought: sum(of: Trade_Side_AmountInUSD, if: { Trade: { Side: { Type: { is: buy } } } })
-            sold: sum(of: Trade_Side_AmountInUSD, if: { Trade: { Side: { Type: { is: sell } } } })
-            lastTrade: maximum(of: Block_Date)
+            Sell {
+              AmountInUSD
+              Amount
+            }
+            Dex {
+              ProtocolName
+            }
+          }
+          Block {
+            Time
           }
         }
       }
-    `;
+    }`;
 
     const response = await axios.post(
       BITQUERY_URL,
@@ -82,71 +85,91 @@ export const scanSmartWallets = async (): Promise<SmartWallet[]> => {
       }
     );
 
-    const trades = response.data?.data?.Solana?.DEXTradeByTokens || [];
-
-    if (trades.length === 0) {
-      console.warn("Bitquery returned no trades data.");
+    // Check for GraphQL errors
+    if (response.data?.errors) {
+      console.error("Bitquery GraphQL errors:", JSON.stringify(response.data.errors));
       return cachedWallets || [];
     }
 
-    // Aggregate per wallet
-    const walletMap = new Map<string, SmartWallet>();
+    const trades = response.data?.data?.Solana?.DEXTrades || [];
+    console.log(`Bitquery returned ${trades.length} trades.`);
+
+    if (trades.length === 0) {
+      console.warn("Bitquery returned no trades.");
+      return cachedWallets || [];
+    }
+
+    // Aggregate per wallet address
+    const walletMap = new Map<string, {
+      address: string;
+      tradeCount: number;
+      totalBought: number;
+      totalSold: number;
+      dexes: Set<string>;
+      lastTradeAt: Date;
+      wins: number;
+    }>();
 
     for (const item of trades) {
-      const owner = item.Trade?.Account?.Owner || '';
-      if (!owner) continue;
+      const address = item.Trade?.Buy?.Account?.Address || '';
+      if (!address || address.length < 30) continue;
 
+      const boughtUsd = parseFloat(item.Trade?.Buy?.AmountInUSD) || 0;
+      const soldUsd = parseFloat(item.Trade?.Sell?.AmountInUSD) || 0;
       const dexName = item.Trade?.Dex?.ProtocolName || 'Unknown';
-      const bought = parseFloat(item.bought) || 0;
-      const sold = parseFloat(item.sold) || 0;
-      const pnl = sold - bought; // Simple PNL: what you sold - what you bought
-      const count = parseInt(item.tradeCount) || 0;
-      const lastTradeDate = new Date(item.lastTrade || Date.now());
+      const tradeTime = new Date(item.Block?.Time || Date.now());
+      const isWin = soldUsd > boughtUsd;
 
-      if (walletMap.has(owner)) {
-        const existing = walletMap.get(owner)!;
-        existing.tradeCount += count;
-        existing.pnl += pnl;
-        if (!existing.dexes.includes(dexName)) {
-          existing.dexes.push(dexName);
-        }
-        if (lastTradeDate > existing.lastTradeAt) {
-          existing.lastTradeAt = lastTradeDate;
+      if (walletMap.has(address)) {
+        const existing = walletMap.get(address)!;
+        existing.tradeCount += 1;
+        existing.totalBought += boughtUsd;
+        existing.totalSold += soldUsd;
+        existing.dexes.add(dexName);
+        if (isWin) existing.wins += 1;
+        if (tradeTime > existing.lastTradeAt) {
+          existing.lastTradeAt = tradeTime;
         }
       } else {
-        walletMap.set(owner, {
-          address: owner,
-          tradeCount: count,
-          winRate: 0, // Will calculate below
-          pnl: pnl,
-          dexes: [dexName],
-          lastTradeAt: lastTradeDate,
+        walletMap.set(address, {
+          address,
+          tradeCount: 1,
+          totalBought: boughtUsd,
+          totalSold: soldUsd,
+          dexes: new Set([dexName]),
+          lastTradeAt: tradeTime,
+          wins: isWin ? 1 : 0,
         });
       }
     }
 
-    // Calculate winRate estimate and filter
-    let results = Array.from(walletMap.values()).map(w => {
-      // Estimate winRate: if PNL is positive relative to volume, higher win rate
-      const totalVolume = Math.abs(w.pnl) + 1;
-      const estimatedWinRate = w.pnl > 0
-        ? Math.min(50 + (w.pnl / totalVolume) * 50, 99)
-        : Math.max(50 - (Math.abs(w.pnl) / totalVolume) * 50, 1);
-      w.winRate = Math.round(estimatedWinRate * 10) / 10;
-      return w;
-    });
-
-    // Filter: PNL > 0 and tradeCount > 10 (relaxed filter to get results)
-    results = results
-      .filter(w => w.pnl > 0 && w.tradeCount >= 10)
+    // Convert to SmartWallet array
+    let results: SmartWallet[] = Array.from(walletMap.values())
+      .map(w => ({
+        address: w.address,
+        tradeCount: w.tradeCount,
+        winRate: w.tradeCount > 0 ? Math.round((w.wins / w.tradeCount) * 100 * 10) / 10 : 0,
+        pnl: Math.round((w.totalSold - w.totalBought) * 100) / 100,
+        dexes: Array.from(w.dexes),
+        lastTradeAt: w.lastTradeAt,
+      }))
+      .filter(w => w.pnl > 0 && w.tradeCount >= 2) // Must be profitable, min 2 trades
       .sort((a, b) => b.pnl - a.pnl)
       .slice(0, 5);
 
-    // Fallback: if strict filter returns nothing, just take top 5 by PNL
+    // Fallback: if no profitable wallets, just take top 5 by volume
     if (results.length === 0) {
-      console.log("No wallets matched filter. Returning top 5 by PNL...");
+      console.log("No profitable wallets found. Returning top 5 by trade count...");
       results = Array.from(walletMap.values())
-        .sort((a, b) => b.pnl - a.pnl)
+        .map(w => ({
+          address: w.address,
+          tradeCount: w.tradeCount,
+          winRate: w.tradeCount > 0 ? Math.round((w.wins / w.tradeCount) * 100 * 10) / 10 : 0,
+          pnl: Math.round((w.totalSold - w.totalBought) * 100) / 100,
+          dexes: Array.from(w.dexes),
+          lastTradeAt: w.lastTradeAt,
+        }))
+        .sort((a, b) => b.tradeCount - a.tradeCount)
         .slice(0, 5);
     }
 
@@ -156,12 +179,7 @@ export const scanSmartWallets = async (): Promise<SmartWallet[]> => {
     return results;
 
   } catch (error: any) {
-    console.error("Bitquery API Error:", error?.response?.status, error?.response?.data?.errors || error.message);
-
-    if (error?.response?.status === 429 && cachedWallets) {
-      return cachedWallets;
-    }
-
+    console.error("Bitquery API Error:", error?.response?.status, error?.response?.data || error.message);
     return cachedWallets || [];
   }
 };
