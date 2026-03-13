@@ -12,8 +12,13 @@ export interface SmartWallet {
   lastTradeAt: Date;
 }
 
+// ===== CACHE: prevent spamming Birdeye API (cache 5 minutes) =====
+let cachedWallets: SmartWallet[] | null = null;
+let cacheTimestamp = 0;
+const CACHE_DURATION_MS = 5 * 60 * 1000; // 5 menit
+
 /**
- * Fetch top trader wallets from Birdeye API and filter by smart criteria.
+ * Fetch top trader wallets from Birdeye API with caching.
  */
 export const scanSmartWallets = async (): Promise<SmartWallet[]> => {
   if (!config.BIRDEYE_API_KEY) {
@@ -21,10 +26,15 @@ export const scanSmartWallets = async (): Promise<SmartWallet[]> => {
     return [];
   }
 
+  // Return cached data if still fresh
+  if (cachedWallets && (Date.now() - cacheTimestamp < CACHE_DURATION_MS)) {
+    console.log("Returning cached smart wallets data.");
+    return cachedWallets;
+  }
+
   try {
     console.log("Fetching top traders from Birdeye API...");
 
-    // Fetch top gainers (traders with highest PNL)
     const response = await axios.get(`${BIRDEYE_BASE_URL}/trader/gainers-losers`, {
       headers: {
         'X-API-KEY': config.BIRDEYE_API_KEY,
@@ -35,66 +45,72 @@ export const scanSmartWallets = async (): Promise<SmartWallet[]> => {
         sort_by: 'PnL',
         sort_type: 'desc',
         offset: 0,
-        limit: 50, // Fetch 50, then filter down to top 5
+        limit: 50,
         time_frame: '30D',
       },
+      timeout: 15000,
     });
 
     const data = response.data?.data?.items || response.data?.data || [];
+    const result = processWalletData(data);
+    
+    // Save to cache
+    cachedWallets = result;
+    cacheTimestamp = Date.now();
+    return result;
 
-    if (!data || data.length === 0) {
-      console.warn("Birdeye returned empty data. Trying alternative endpoint...");
-      return await fetchFromAlternativeEndpoint();
-    }
-
-    // Map and filter based on smart wallet criteria
-    const candidates: SmartWallet[] = data
-      .map((item: any) => ({
-        address: item.address || item.wallet || item.owner || '',
-        tradeCount: item.trade_count || item.tradeCount || item.txs || 0,
-        winRate: item.win_rate || item.winRate || 0,
-        pnl: item.pnl || item.realized_pnl || item.total_pnl || 0,
-        dexes: item.dexes || item.platforms || ['Unknown'],
-        lastTradeAt: new Date(item.last_trade_time || item.last_trade_at || Date.now()),
-      }))
-      .filter((w: SmartWallet) =>
-        w.tradeCount >= 500 &&
-        w.winRate >= 85 &&
-        w.pnl >= 50000
-      );
-
-    // Sort by PNL descending, take top 5
-    const top5 = candidates
-      .sort((a: SmartWallet, b: SmartWallet) => b.pnl - a.pnl)
-      .slice(0, 5);
-
-    if (top5.length === 0) {
-      console.warn("No wallets matched strict criteria. Returning top 5 by PNL without strict filter...");
-      return data
-        .map((item: any) => ({
-          address: item.address || item.wallet || item.owner || '',
-          tradeCount: item.trade_count || item.tradeCount || item.txs || 0,
-          winRate: item.win_rate || item.winRate || 0,
-          pnl: item.pnl || item.realized_pnl || item.total_pnl || 0,
-          dexes: item.dexes || item.platforms || ['Unknown'],
-          lastTradeAt: new Date(item.last_trade_time || item.last_trade_at || Date.now()),
-        }))
-        .sort((a: SmartWallet, b: SmartWallet) => b.pnl - a.pnl)
-        .slice(0, 5);
-    }
-
-    return top5;
   } catch (error: any) {
-    console.error("Error fetching from Birdeye API:", error?.response?.status, error?.response?.data || error.message);
-
-    // If the specific endpoint fails, try alternative
-    try {
-      return await fetchFromAlternativeEndpoint();
-    } catch (altError) {
-      console.error("Alternative endpoint also failed:", altError);
+    // Handle 429 rate limit
+    if (error?.response?.status === 429) {
+      console.warn("Birdeye API rate limited (429). Returning cached data or empty.");
+      if (cachedWallets) return cachedWallets;
       return [];
     }
+
+    console.error("Error fetching from Birdeye:", error?.response?.status, error?.response?.data?.message || error.message);
+
+    // Try alternative endpoint
+    try {
+      const altResult = await fetchFromAlternativeEndpoint();
+      cachedWallets = altResult;
+      cacheTimestamp = Date.now();
+      return altResult;
+    } catch (altError: any) {
+      if (altError?.response?.status === 429 && cachedWallets) return cachedWallets;
+      console.error("Alternative endpoint also failed.");
+      return cachedWallets || [];
+    }
   }
+};
+
+/**
+ * Process raw API data into SmartWallet format
+ */
+const processWalletData = (data: any[]): SmartWallet[] => {
+  if (!data || data.length === 0) return [];
+
+  const mapped: SmartWallet[] = data.map((item: any) => ({
+    address: item.address || item.wallet || item.owner || '',
+    tradeCount: item.trade_count || item.tradeCount || item.txs || 0,
+    winRate: item.win_rate || item.winRate || 0,
+    pnl: item.pnl || item.realized_pnl || item.total_pnl || 0,
+    dexes: item.dexes || item.platforms || ['Unknown'],
+    lastTradeAt: new Date(item.last_trade_time || item.last_trade_at || Date.now()),
+  }));
+
+  // Try strict filter first
+  const strict = mapped
+    .filter((w) => w.tradeCount >= 500 && w.winRate >= 85 && w.pnl >= 50000)
+    .sort((a, b) => b.pnl - a.pnl)
+    .slice(0, 5);
+
+  if (strict.length > 0) return strict;
+
+  // Fallback: return top 5 by PNL without strict filter
+  console.log("No wallets matched strict criteria. Returning top 5 by PNL...");
+  return mapped
+    .sort((a, b) => b.pnl - a.pnl)
+    .slice(0, 5);
 };
 
 /**
@@ -116,26 +132,11 @@ const fetchFromAlternativeEndpoint = async (): Promise<SmartWallet[]> => {
       limit: 50,
       time_frame: '30D',
     },
+    timeout: 15000,
   });
 
   const data = response.data?.data?.items || response.data?.data || [];
-
-  if (!data || data.length === 0) {
-    console.warn("Alternative endpoint also returned empty.");
-    return [];
-  }
-
-  return data
-    .map((item: any) => ({
-      address: item.address || item.wallet || item.owner || '',
-      tradeCount: item.trade_count || item.tradeCount || item.txs || 0,
-      winRate: item.win_rate || item.winRate || 0,
-      pnl: item.pnl || item.realized_pnl || item.total_pnl || 0,
-      dexes: item.dexes || item.platforms || ['Unknown'],
-      lastTradeAt: new Date(item.last_trade_time || item.last_trade_at || Date.now()),
-    }))
-    .sort((a: SmartWallet, b: SmartWallet) => b.pnl - a.pnl)
-    .slice(0, 5);
+  return processWalletData(data);
 };
 
 /**
