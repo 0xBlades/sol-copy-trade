@@ -1,5 +1,5 @@
 import { Context } from 'telegraf';
-import { scanSmartWallets, SmartWallet } from '../../services/scanner';
+import { scanSmartWallets, formatTimeAgo } from '../../services/scanner';
 
 export const handleScanCommand = async (ctx: Context) => {
   try {
@@ -19,7 +19,8 @@ export const handleScanCommand = async (ctx: Context) => {
       message += `   📈 Win Rate: ${wallet.winRate}%\n`;
       message += `   💰 PNL: $${wallet.pnl.toLocaleString()}\n`;
       message += `   🔄 DEX: ${wallet.dexes.join(', ')}\n`;
-      message += `   👉 /copy ${wallet.address}\n\n`;
+      message += `   🕐 Last Trade: ${formatTimeAgo(wallet.lastTradeAt)}\n`;
+      message += `   👉 /copy\\_${wallet.address}\n\n`;
     });
 
     await ctx.replyWithMarkdown(message);
